@@ -23,16 +23,17 @@ var linkNextRE = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
 
 // Client talks to the GitHub API via go-gh.
 type Client struct {
-	rest               *api.RESTClient
-	gql                *api.GraphQLClient
-	repo               repository.Repository // effective repo (switches to upstream for forks)
-	currentUser        string                // cached authenticated user login
-	upstreamCandidates []remoteInfo          // non-user remotes to try for fork PR detection
+	rest        *api.RESTClient
+	gql         *api.GraphQLClient
+	repo        repository.Repository // effective repo (switches to upstream for forks)
+	currentUser string                // cached authenticated user login
+	userCh      chan string           // background user fetch channel
+	allRemotes  []remoteInfo          // all parsed git remotes
 }
 
 // NewClient creates a client, auto-detecting the repo from the current
-// directory. It fetches the current user once and caches it, then uses
-// git remotes to prepare fork detection. No redundant API calls.
+// directory. It parses git remotes locally and fetches the current user
+// in parallel with any subsequent API call the caller makes.
 func NewClient() (*Client, error) {
 	repo, err := repository.Current()
 	if err != nil {
@@ -52,18 +53,37 @@ func NewClient() (*Client, error) {
 
 	c := &Client{rest: rest, gql: gql, repo: repo}
 
-	// Fetch current user once — used for fork detection, needs-reply, etc.
-	c.currentUser, _ = c.fetchCurrentUser()
+	// Parse git remotes (local, no API call).
+	allRemotes, _ := gitRemotes()
+	c.allRemotes = allRemotes
 
-	// Parse git remotes (local, no API call) to find upstream candidates.
-	c.detectUpstreamCandidates()
+	// Start fetching current user in the background.
+	c.userCh = make(chan string, 1)
+	go func() {
+		user, _ := c.fetchCurrentUser()
+		c.userCh <- user
+	}()
 
 	return c, nil
 }
 
-// CurrentUser returns the cached authenticated user login.
-func (c *Client) CurrentUser() string {
+// resolveCurrentUser blocks until the background user fetch completes
+// and caches the result. Subsequent calls return immediately.
+func (c *Client) resolveCurrentUser() string {
+	if c.currentUser != "" {
+		return c.currentUser
+	}
+	if c.userCh != nil {
+		c.currentUser = <-c.userCh
+		c.userCh = nil // done, don't read again
+	}
 	return c.currentUser
+}
+
+// CurrentUser returns the authenticated user login, blocking on first
+// call until the background fetch completes.
+func (c *Client) CurrentUser() string {
+	return c.resolveCurrentUser()
 }
 
 // Repo returns the "owner/repo" string.
@@ -80,25 +100,6 @@ func (c *Client) fetchCurrentUser() (string, error) {
 		return "", err
 	}
 	return user.Login, nil
-}
-
-// detectUpstreamCandidates parses git remotes and collects those that
-// don't belong to the current user — potential upstream repos for forks.
-func (c *Client) detectUpstreamCandidates() {
-	if c.currentUser == "" {
-		return
-	}
-
-	remotes, err := gitRemotes()
-	if err != nil {
-		return
-	}
-
-	for _, r := range remotes {
-		if r.owner != c.currentUser {
-			c.upstreamCandidates = append(c.upstreamCandidates, r)
-		}
-	}
 }
 
 // -- PR info ------------------------------------------------------------------
@@ -142,32 +143,49 @@ func (c *Client) GetPRInfo(prNum int) (*model.PRInfo, error) {
 }
 
 // getPRForCurrentBranch detects the current git branch and finds the
-// matching open PR. Tries the current repo first (non-fork), then
-// each upstream candidate (fork workflow).
+// matching open PR. It builds an ordered list of repos to try:
+// non-user remotes first (upstream, where PRs usually live in fork
+// workflows), then the current repo as fallback.
 func (c *Client) getPRForCurrentBranch() (*model.PRInfo, error) {
 	branch, err := currentBranch()
 	if err != nil {
 		return nil, fmt.Errorf("detecting current branch: %w", err)
 	}
 
-	headOwner := c.currentUser
+	user := c.resolveCurrentUser()
+	headOwner := user
 	if headOwner == "" {
 		headOwner = c.repo.Owner
 	}
 
-	// Try the current repo (non-fork case).
-	if pr, err := c.searchPR(c.repo.Owner, c.repo.Name, headOwner, branch); err == nil {
-		return pr, nil
+	// Build search order: non-user remotes first, then current repo.
+	type candidate struct{ owner, name string }
+	seen := make(map[string]bool)
+	var candidates []candidate
+
+	for _, r := range c.allRemotes {
+		if r.owner == user {
+			continue
+		}
+		key := r.owner + "/" + r.name
+		if !seen[key] {
+			seen[key] = true
+			candidates = append(candidates, candidate{r.owner, r.name})
+		}
 	}
 
-	// Try each upstream candidate (fork case).
-	for _, candidate := range c.upstreamCandidates {
-		if pr, err := c.searchPR(candidate.owner, candidate.name, headOwner, branch); err == nil {
-			// Switch to upstream for all subsequent API calls.
+	// Add current repo last (covers non-fork workflows or self-PRs).
+	key := c.repo.Owner + "/" + c.repo.Name
+	if !seen[key] {
+		candidates = append(candidates, candidate{c.repo.Owner, c.repo.Name})
+	}
+
+	for _, cand := range candidates {
+		if pr, err := c.searchPR(cand.owner, cand.name, headOwner, branch); err == nil {
 			c.repo = repository.Repository{
 				Host:  c.repo.Host,
-				Owner: candidate.owner,
-				Name:  candidate.name,
+				Owner: cand.owner,
+				Name:  cand.name,
 			}
 			return pr, nil
 		}
