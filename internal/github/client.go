@@ -141,25 +141,55 @@ func (c *Client) GetIssueComments(prNum int) ([]model.Comment, error) {
 	return comments, nil
 }
 
-// GetThreads fetches review comments and thread metadata, assembles
-// them into sorted threads with stable indexes.
+// GetThreads fetches review comments and thread metadata in parallel,
+// then assembles them into sorted threads with stable indexes.
 func (c *Client) GetThreads(prNum int) ([]model.Thread, error) {
-	out, err := ghExec("api", fmt.Sprintf("repos/%s/pulls/%d/comments", c.repo, prNum), "--paginate")
-	if err != nil {
-		return nil, fmt.Errorf("fetching review comments: %w", err)
+	type commentsResult struct {
+		comments []reviewComment
+		err      error
+	}
+	type infosResult struct {
+		infos []gqlThreadInfo
+		err   error
 	}
 
-	var rawComments []reviewComment
-	if err := json.Unmarshal(out, &rawComments); err != nil {
-		return nil, fmt.Errorf("parsing review comments: %w", err)
+	commentsCh := make(chan commentsResult, 1)
+	infosCh := make(chan infosResult, 1)
+
+	// Fetch REST comments and GraphQL thread infos concurrently.
+	go func() {
+		out, err := ghExec("api", fmt.Sprintf("repos/%s/pulls/%d/comments", c.repo, prNum), "--paginate")
+		if err != nil {
+			commentsCh <- commentsResult{err: fmt.Errorf("fetching review comments: %w", err)}
+			return
+		}
+		var raw []reviewComment
+		if err := json.Unmarshal(out, &raw); err != nil {
+			commentsCh <- commentsResult{err: fmt.Errorf("parsing review comments: %w", err)}
+			return
+		}
+		commentsCh <- commentsResult{comments: raw}
+	}()
+
+	go func() {
+		infos, err := c.fetchThreadInfos(prNum)
+		if err != nil {
+			infosCh <- infosResult{err: fmt.Errorf("fetching thread metadata: %w", err)}
+			return
+		}
+		infosCh <- infosResult{infos: infos}
+	}()
+
+	cr := <-commentsCh
+	if cr.err != nil {
+		return nil, cr.err
+	}
+	ir := <-infosCh
+	if ir.err != nil {
+		return nil, ir.err
 	}
 
-	threadInfos, err := c.fetchThreadInfos(prNum)
-	if err != nil {
-		return nil, fmt.Errorf("fetching thread metadata: %w", err)
-	}
-
-	return buildThreads(rawComments, threadInfos), nil
+	return buildThreads(cr.comments, ir.infos), nil
 }
 
 // ResolveThread resolves a review thread via GraphQL mutation.

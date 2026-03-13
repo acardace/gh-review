@@ -54,3 +54,12 @@ func AllBots(comments []Comment) bool {
 	}
 	return true
 }
+
+// NeedsReply reports whether the last comment in the thread was left
+// by someone other than currentUser, indicating a reply is expected.
+func (t *Thread) NeedsReply(currentUser string) bool {
+	if currentUser == "" || len(t.Comments) == 0 {
+		return false
+	}
+	return t.Comments[len(t.Comments)-1].User != currentUser
+}

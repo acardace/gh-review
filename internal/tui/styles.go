@@ -64,4 +64,14 @@ var (
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderTop(true).
 			BorderForeground(colorDim)
+
+	// Compose view
+	composeBorderStyle = lipgloss.NewStyle().
+				BorderStyle(lipgloss.RoundedBorder()).
+				BorderForeground(colorMagenta).
+				Padding(0, 1)
+
+	composeHeaderStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(colorMagenta)
 )

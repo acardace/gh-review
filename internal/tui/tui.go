@@ -44,9 +44,10 @@ type commentPostedMsg struct {
 
 // Model is the top-level bubbletea model.
 type Model struct {
-	client  *github.Client
-	pr      *model.PRInfo
-	threads []model.Thread
+	client      *github.Client
+	pr          *model.PRInfo
+	threads     []model.Thread
+	currentUser string
 
 	screen     screen
 	list       listView
@@ -65,20 +66,20 @@ type Model struct {
 }
 
 // New creates the TUI model with pre-fetched data.
-func New(client *github.Client, pr *model.PRInfo, threads []model.Thread) Model {
-	user, _ := client.CurrentUser()
+func New(client *github.Client, pr *model.PRInfo, threads []model.Thread, currentUser string) Model {
 	return Model{
-		client:  client,
-		pr:      pr,
-		threads: threads,
-		screen:  screenList,
-		list:    newListView(threads, pr, user),
+		client:      client,
+		pr:          pr,
+		threads:     threads,
+		currentUser: currentUser,
+		screen:      screenList,
+		list:        newListView(threads, pr, currentUser),
 	}
 }
 
 // Run starts the bubbletea program.
-func Run(client *github.Client, pr *model.PRInfo, threads []model.Thread) error {
-	m := New(client, pr, threads)
+func Run(client *github.Client, pr *model.PRInfo, threads []model.Thread, currentUser string) error {
+	m := New(client, pr, threads, currentUser)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
@@ -203,7 +204,7 @@ func (m Model) handleAction(action viewAction, cmd tea.Cmd, t *model.Thread) (te
 	case actionOpenDetail:
 		if t != nil {
 			m.screen = screenDetail
-			m.detail = newDetailView(t, m.pr, m.list.currentUser, m.width, m.height, m.list.hideBots)
+			m.detail = newDetailView(t, m.pr, m.currentUser, m.width, m.height, m.list.hideBots)
 			m.status = ""
 		}
 	case actionResolve:
@@ -229,7 +230,7 @@ func (m Model) handleAction(action viewAction, cmd tea.Cmd, t *model.Thread) (te
 			// If we're on the list, switch to detail first
 			if m.screen == screenList {
 				m.screen = screenDetail
-				m.detail = newDetailView(t, m.pr, m.list.currentUser, m.width, m.height, m.list.hideBots)
+				m.detail = newDetailView(t, m.pr, m.currentUser, m.width, m.height, m.list.hideBots)
 			}
 			m.updateDetailSize()
 			// Scroll detail to bottom so context is visible
@@ -277,34 +278,40 @@ func (m Model) View() string {
 }
 
 func (m *Model) resolveThreadFn(t *model.Thread) func() tea.Msg {
-	return func() tea.Msg {
-		if t.ThreadNodeID == "" {
-			return statusMsg{err: fmt.Errorf("no thread ID for #%d", t.Index)}
-		}
-		if t.Resolved {
-			return statusMsg{text: fmt.Sprintf("#%d is already resolved", t.Index)}
-		}
-		if err := m.client.ResolveThread(t.ThreadNodeID); err != nil {
-			return statusMsg{err: err}
-		}
-		t.Resolved = true
-		return statusMsg{text: fmt.Sprintf("✓ Resolved #%d", t.Index)}
-	}
+	return m.toggleResolveFn(t, true)
 }
 
 func (m *Model) unresolveThreadFn(t *model.Thread) func() tea.Msg {
+	return m.toggleResolveFn(t, false)
+}
+
+func (m *Model) toggleResolveFn(t *model.Thread, resolve bool) func() tea.Msg {
 	return func() tea.Msg {
 		if t.ThreadNodeID == "" {
 			return statusMsg{err: fmt.Errorf("no thread ID for #%d", t.Index)}
 		}
-		if !t.Resolved {
-			return statusMsg{text: fmt.Sprintf("#%d is already open", t.Index)}
+		if t.Resolved == resolve {
+			state := "resolved"
+			if !resolve {
+				state = "open"
+			}
+			return statusMsg{text: fmt.Sprintf("#%d is already %s", t.Index, state)}
 		}
-		if err := m.client.UnresolveThread(t.ThreadNodeID); err != nil {
+		var err error
+		if resolve {
+			err = m.client.ResolveThread(t.ThreadNodeID)
+		} else {
+			err = m.client.UnresolveThread(t.ThreadNodeID)
+		}
+		if err != nil {
 			return statusMsg{err: err}
 		}
-		t.Resolved = false
-		return statusMsg{text: fmt.Sprintf("✓ Unresolved #%d", t.Index)}
+		t.Resolved = resolve
+		verb := "Resolved"
+		if !resolve {
+			verb = "Unresolved"
+		}
+		return statusMsg{text: fmt.Sprintf("✓ %s #%d", verb, t.Index)}
 	}
 }
 
@@ -332,11 +339,10 @@ func (m *Model) postComment(t *model.Thread, body string) tea.Cmd {
 			return statusMsg{err: fmt.Errorf("posting comment: %w", err)}
 		}
 
-		user, _ := m.client.CurrentUser()
 		return commentPostedMsg{
 			threadIndex: t.Index,
 			comment: model.Comment{
-				User:      user,
+				User:      m.currentUser,
 				UserType:  "User",
 				Body:      body,
 				CreatedAt: time.Now(),

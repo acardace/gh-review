@@ -88,10 +88,35 @@ func run(w io.Writer, args []string, opts *options) error {
 		return err
 	}
 
-	threads, err := client.GetThreads(pr.Number)
-	if err != nil {
-		return fmt.Errorf("fetching threads: %w", err)
+	// Fetch threads and current user in parallel.
+	type threadResult struct {
+		threads []model.Thread
+		err     error
 	}
+	type userResult struct {
+		user string
+		err  error
+	}
+	threadsCh := make(chan threadResult, 1)
+	userCh := make(chan userResult, 1)
+
+	go func() {
+		t, err := client.GetThreads(pr.Number)
+		threadsCh <- threadResult{t, err}
+	}()
+	go func() {
+		u, err := client.CurrentUser()
+		userCh <- userResult{u, err}
+	}()
+
+	tr := <-threadsCh
+	if tr.err != nil {
+		return fmt.Errorf("fetching threads: %w", tr.err)
+	}
+	threads := tr.threads
+
+	ur := <-userCh
+	currentUser := ur.user // ignore error, non-critical
 
 	// Action flags bypass the TUI.
 	switch {
@@ -120,55 +145,52 @@ func run(w io.Writer, args []string, opts *options) error {
 		}
 		return handleList(w, pr, issueComments, threads, opts)
 	default:
-		return tui.Run(client, pr, threads)
+		return tui.Run(client, pr, threads, currentUser)
 	}
 }
 
 func handleResolve(w io.Writer, client *github.Client, threads []model.Thread, opts *options) error {
-	thread := findThread(threads, opts.resolveThread)
-	if thread == nil {
-		return fmt.Errorf("thread #%d not found (valid range: 1-%d)", opts.resolveThread, len(threads))
-	}
-	if thread.ThreadNodeID == "" {
-		return fmt.Errorf("thread #%d has no GraphQL node ID", opts.resolveThread)
-	}
-	if thread.Resolved {
-		fmt.Fprintf(w, "\n  %sThread #%d is already resolved.%s\n\n", render.C.Dim, thread.Index, render.C.RST)
-		return nil
-	}
-
-	render.Thread(w, thread, opts.noBots)
-
-	if err := client.ResolveThread(thread.ThreadNodeID); err != nil {
-		return fmt.Errorf("resolving: %w", err)
-	}
-
-	fmt.Fprintf(w, "\n  %s✓ Resolved thread #%d (%s:%d)%s\n\n",
-		render.C.Grn, thread.Index, thread.Path, thread.Line, render.C.RST)
-	return nil
+	return handleToggleResolve(w, client, threads, opts.resolveThread, true, opts.noBots)
 }
 
 func handleUnresolve(w io.Writer, client *github.Client, threads []model.Thread, opts *options) error {
-	thread := findThread(threads, opts.unresolveThread)
+	return handleToggleResolve(w, client, threads, opts.unresolveThread, false, opts.noBots)
+}
+
+func handleToggleResolve(w io.Writer, client *github.Client, threads []model.Thread, idx int, resolve, noBots bool) error {
+	thread := findThread(threads, idx)
 	if thread == nil {
-		return fmt.Errorf("thread #%d not found (valid range: 1-%d)", opts.unresolveThread, len(threads))
+		return fmt.Errorf("thread #%d not found (valid range: 1-%d)", idx, len(threads))
 	}
 	if thread.ThreadNodeID == "" {
-		return fmt.Errorf("thread #%d has no GraphQL node ID", opts.unresolveThread)
+		return fmt.Errorf("thread #%d has no GraphQL node ID", idx)
 	}
-	if !thread.Resolved {
-		fmt.Fprintf(w, "\n  %sThread #%d is already open.%s\n\n", render.C.Dim, thread.Index, render.C.RST)
+
+	if thread.Resolved == resolve {
+		state := "resolved"
+		if !resolve {
+			state = "open"
+		}
+		fmt.Fprintf(w, "\n  %sThread #%d is already %s.%s\n\n", render.C.Dim, thread.Index, state, render.C.RST)
 		return nil
 	}
 
-	render.Thread(w, thread, opts.noBots)
+	render.Thread(w, thread, noBots)
 
-	if err := client.UnresolveThread(thread.ThreadNodeID); err != nil {
-		return fmt.Errorf("unresolving: %w", err)
+	var err error
+	verb := "Resolved"
+	if resolve {
+		err = client.ResolveThread(thread.ThreadNodeID)
+	} else {
+		verb = "Unresolved"
+		err = client.UnresolveThread(thread.ThreadNodeID)
+	}
+	if err != nil {
+		return err
 	}
 
-	fmt.Fprintf(w, "\n  %s✓ Unresolved thread #%d (%s:%d)%s\n\n",
-		render.C.Grn, thread.Index, thread.Path, thread.Line, render.C.RST)
+	fmt.Fprintf(w, "\n  %s✓ %s thread #%d (%s:%d)%s\n\n",
+		render.C.Grn, verb, thread.Index, thread.Path, thread.Line, render.C.RST)
 	return nil
 }
 

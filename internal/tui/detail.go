@@ -79,11 +79,8 @@ func (d detailView) view() string {
 		status = resolvedBadge
 	}
 	needsReply := ""
-	if len(d.thread.Comments) > 0 && d.currentUser != "" {
-		last := d.thread.Comments[len(d.thread.Comments)-1]
-		if last.User != d.currentUser {
-			needsReply = lipgloss.NewStyle().Foreground(colorCyan).Render("  ← needs reply")
-		}
+	if d.thread.NeedsReply(d.currentUser) {
+		needsReply = lipgloss.NewStyle().Foreground(colorCyan).Render("  ← needs reply")
 	}
 
 	header := headerStyle.Width(d.width).Render(

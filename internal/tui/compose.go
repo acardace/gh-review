@@ -61,19 +61,10 @@ func (c composeView) view() string {
 		return ""
 	}
 
-	border := lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(colorMagenta).
-		Padding(0, 1)
-
-	header := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(colorMagenta).
-		Render("Comment")
-
+	header := composeHeaderStyle.Render("Comment")
 	hint := dimStyle.Render("  ctrl+s: submit  esc: cancel")
 
-	return border.Render(header + hint + "\n" + c.textarea.View())
+	return composeBorderStyle.Render(header + hint + "\n" + c.textarea.View())
 }
 
 func (c composeView) value() string {

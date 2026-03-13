@@ -46,10 +46,7 @@ func (l listView) visible() []int {
 }
 
 func (l listView) threadNeedsReply(t *model.Thread) bool {
-	if l.currentUser == "" || len(t.Comments) == 0 {
-		return false
-	}
-	return t.Comments[len(t.Comments)-1].User != l.currentUser
+	return t.NeedsReply(l.currentUser)
 }
 
 func (l *listView) update(msg tea.Msg) (viewAction, tea.Cmd) {

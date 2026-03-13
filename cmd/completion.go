@@ -23,25 +23,14 @@ func registerCompletions(root *cobra.Command, _ *options) {
 }
 
 func completeResolvedThreads(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
-	threads, err := fetchCurrentThreads()
-	if err != nil {
-		return nil, cobra.ShellCompDirectiveError
-	}
-
-	var completions []string
-	for _, t := range threads {
-		if !t.Resolved || len(t.Comments) == 0 {
-			continue
-		}
-		c := t.Comments[0]
-		body := strings.Join(strings.Fields(c.Body), " ")
-		desc := fmt.Sprintf("[#%d %s:%d] @%s: %s", t.Index, t.Path, t.Line, c.User, body)
-		completions = append(completions, fmt.Sprintf("%d\t%s", t.Index, desc))
-	}
-	return completions, cobra.ShellCompDirectiveNoFileComp
+	return completeThreads(func(t *model.Thread) bool { return t.Resolved })
 }
 
 func completeOpenThreads(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+	return completeThreads(func(t *model.Thread) bool { return !t.Resolved })
+}
+
+func completeThreads(filter func(*model.Thread) bool) ([]string, cobra.ShellCompDirective) {
 	threads, err := fetchCurrentThreads()
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
@@ -49,7 +38,7 @@ func completeOpenThreads(_ *cobra.Command, _ []string, _ string) ([]string, cobr
 
 	var completions []string
 	for _, t := range threads {
-		if t.Resolved || len(t.Comments) == 0 {
+		if !filter(&t) || len(t.Comments) == 0 {
 			continue
 		}
 		c := t.Comments[0]
