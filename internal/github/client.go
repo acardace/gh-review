@@ -33,6 +33,15 @@ func NewClient() (*Client, error) {
 // Repo returns the owner/repo string.
 func (c *Client) Repo() string { return c.repo }
 
+// CurrentUser returns the authenticated user's login.
+func (c *Client) CurrentUser() (string, error) {
+	out, err := ghExec("api", "user", "--jq", ".login")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 const prFields = "number,title,url,state,author,baseRefName,headRefName"
 
 // GetPRInfo fetches PR metadata. If prNum is 0, auto-detects from current branch.

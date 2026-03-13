@@ -5,6 +5,7 @@ package tui
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/acardace/gh-review/internal/editor"
 	"github.com/acardace/gh-review/internal/github"
@@ -35,6 +36,13 @@ const (
 type statusMsg struct {
 	text string
 	err  error
+}
+
+// commentPostedMsg is sent after a comment is successfully posted,
+// carrying the data needed to append it to the thread locally.
+type commentPostedMsg struct {
+	threadIndex int
+	comment     model.Comment
 }
 
 // Model is the top-level bubbletea model.
@@ -96,6 +104,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = msg.text
 		}
 		return m, nil
+
+	case commentPostedMsg:
+		m.appendComment(msg)
+		m.status = "✓ Comment posted"
+		return m, nil
 	}
 
 	// Handle confirmation prompt
@@ -110,6 +123,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateDetail(msg)
 	}
 	return m, nil
+}
+
+// appendComment adds the posted comment to the thread and re-renders
+// the detail view if we're looking at that thread.
+func (m *Model) appendComment(msg commentPostedMsg) {
+	for i := range m.threads {
+		if m.threads[i].Index == msg.threadIndex {
+			m.threads[i].Comments = append(m.threads[i].Comments, msg.comment)
+			// Re-render detail view if we're looking at this thread
+			if m.screen == screenDetail && m.detail.thread.Index == msg.threadIndex {
+				m.detail.thread = &m.threads[i]
+				m.detail.lines = m.detail.render()
+				// Scroll to bottom to show the new comment
+				maxScroll := max(0, len(m.detail.lines)-m.detail.contentHeight())
+				m.detail.scroll = maxScroll
+			}
+			break
+		}
+	}
 }
 
 func (m Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -250,7 +282,10 @@ func (m *Model) commentOnThread(t *model.Thread) tea.Cmd {
 		if err != nil {
 			return statusMsg{err: err}
 		}
-		return statusMsg{text: "✓ Comment posted"}
+		return commentPostedMsg{
+			threadIndex: ep.thread.Index,
+			comment:     ep.posted,
+		}
 	})
 }
 
@@ -259,6 +294,7 @@ type editorProcess struct {
 	thread *model.Thread
 	client *github.Client
 	prNum  int
+	posted model.Comment // populated after successful post
 }
 
 func (e *editorProcess) Run() error {
@@ -269,7 +305,19 @@ func (e *editorProcess) Run() error {
 	if body == "" {
 		return fmt.Errorf("aborted (empty message)")
 	}
-	return e.client.ReplyToThread(e.prNum, e.thread.RootID, body)
+	if err := e.client.ReplyToThread(e.prNum, e.thread.RootID, body); err != nil {
+		return err
+	}
+
+	// Build the local comment for immediate display
+	user, _ := e.client.CurrentUser()
+	e.posted = model.Comment{
+		User:      user,
+		UserType:  "User",
+		Body:      body,
+		CreatedAt: time.Now(),
+	}
+	return nil
 }
 
 func (e *editorProcess) SetStdin(_ io.Reader)  {}
