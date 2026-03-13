@@ -4,10 +4,8 @@ package tui
 
 import (
 	"fmt"
-	"io"
 	"time"
 
-	"github.com/acardace/gh-review/internal/editor"
 	"github.com/acardace/gh-review/internal/github"
 	"github.com/acardace/gh-review/internal/model"
 	tea "github.com/charmbracelet/bubbletea"
@@ -38,8 +36,7 @@ type statusMsg struct {
 	err  error
 }
 
-// commentPostedMsg is sent after a comment is successfully posted,
-// carrying the data needed to append it to the thread locally.
+// commentPostedMsg is sent after a comment is successfully posted.
 type commentPostedMsg struct {
 	threadIndex int
 	comment     model.Comment
@@ -58,6 +55,11 @@ type Model struct {
 	confirming bool           // waiting for y/n on resolve/unresolve
 	confirmMsg string         // what we're confirming
 	confirmFn  func() tea.Msg // action to run on "y"
+
+	// Inline compose
+	composing     bool
+	compose       composeView
+	composeThread *model.Thread
 
 	width, height int
 }
@@ -90,11 +92,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.list.width = msg.Width
 		m.list.height = msg.Height
-		m.detail.width = msg.Width
-		m.detail.height = msg.Height
-		if m.screen == screenDetail {
-			m.detail.lines = m.detail.render()
-		}
+		m.updateDetailSize()
 		return m, nil
 
 	case statusMsg:
@@ -111,6 +109,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Composing takes priority over everything
+	if m.composing {
+		return m.updateCompose(msg)
+	}
+
 	// Handle confirmation prompt
 	if m.confirming {
 		return m.updateConfirm(msg)
@@ -125,23 +128,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// appendComment adds the posted comment to the thread and re-renders
-// the detail view if we're looking at that thread.
-func (m *Model) appendComment(msg commentPostedMsg) {
-	for i := range m.threads {
-		if m.threads[i].Index == msg.threadIndex {
-			m.threads[i].Comments = append(m.threads[i].Comments, msg.comment)
-			// Re-render detail view if we're looking at this thread
-			if m.screen == screenDetail && m.detail.thread.Index == msg.threadIndex {
-				m.detail.thread = &m.threads[i]
-				m.detail.lines = m.detail.render()
-				// Scroll to bottom to show the new comment
-				maxScroll := max(0, len(m.detail.lines)-m.detail.contentHeight())
-				m.detail.scroll = maxScroll
-			}
-			break
+func (m *Model) updateDetailSize() {
+	detailHeight := m.height
+	if m.composing {
+		// Reserve space for the compose box: border(2) + header line(1) + textarea lines + padding
+		detailHeight = m.height - composeHeight - 5
+		if detailHeight < 5 {
+			detailHeight = 5
 		}
 	}
+	m.detail.width = m.width
+	m.detail.height = detailHeight
+	if m.screen == screenDetail {
+		m.detail.lines = m.detail.render()
+	}
+}
+
+func (m Model) updateCompose(msg tea.Msg) (tea.Model, tea.Cmd) {
+	action, cmd := m.compose.update(msg)
+	switch action {
+	case composeSubmit:
+		body := m.compose.value()
+		m.composing = false
+		m.updateDetailSize()
+		return m, m.postComment(m.composeThread, body)
+	case composeCancel:
+		m.composing = false
+		m.composeThread = nil
+		m.status = "Cancelled"
+		m.updateDetailSize()
+	}
+	return m, cmd
 }
 
 func (m Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -157,7 +174,6 @@ func (m Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirmFn = nil
 		return m, fn
 	default:
-		// any other key cancels
 		m.confirming = false
 		m.confirmMsg = ""
 		m.confirmFn = nil
@@ -205,7 +221,20 @@ func (m Model) handleAction(action viewAction, cmd tea.Cmd, t *model.Thread) (te
 		}
 	case actionComment:
 		if t != nil {
-			return m, m.commentOnThread(t)
+			m.composing = true
+			m.composeThread = t
+			m.compose = newComposeView(m.width)
+			m.status = ""
+			// If we're on the list, switch to detail first
+			if m.screen == screenList {
+				m.screen = screenDetail
+				m.detail = newDetailView(t, m.width, m.height, m.list.hideBots)
+			}
+			m.updateDetailSize()
+			// Scroll detail to bottom so context is visible
+			maxScroll := max(0, len(m.detail.lines)-m.detail.contentHeight())
+			m.detail.scroll = maxScroll
+			return m, m.compose.textarea.Focus()
 		}
 	}
 	return m, cmd
@@ -234,7 +263,10 @@ func (m Model) View() string {
 		bar = m.detail.statusBar()
 	}
 
-	if m.confirming {
+	if m.composing {
+		content += m.compose.view() + "\n"
+		bar = statusBarStyle.Width(m.width).Render("ctrl+s: submit  esc: cancel")
+	} else if m.confirming {
 		bar = statusBarStyle.Width(m.width).Render(m.confirmMsg)
 	} else if m.status != "" {
 		bar = statusBarStyle.Width(m.width).Render(m.status)
@@ -275,51 +307,39 @@ func (m *Model) unresolveThreadFn(t *model.Thread) func() tea.Msg {
 	}
 }
 
-// commentOnThread suspends the TUI, opens $EDITOR, posts the comment, resumes.
-func (m *Model) commentOnThread(t *model.Thread) tea.Cmd {
-	ep := &editorProcess{thread: t, client: m.client, prNum: m.pr.Number}
-	return tea.Exec(ep, func(err error) tea.Msg {
-		if err != nil {
-			return statusMsg{err: err}
+// appendComment adds the posted comment to the thread and re-renders
+// the detail view if we're looking at that thread.
+func (m *Model) appendComment(msg commentPostedMsg) {
+	for i := range m.threads {
+		if m.threads[i].Index == msg.threadIndex {
+			m.threads[i].Comments = append(m.threads[i].Comments, msg.comment)
+			if m.screen == screenDetail && m.detail.thread.Index == msg.threadIndex {
+				m.detail.thread = &m.threads[i]
+				m.detail.lines = m.detail.render()
+				maxScroll := max(0, len(m.detail.lines)-m.detail.contentHeight())
+				m.detail.scroll = maxScroll
+			}
+			break
 		}
+	}
+}
+
+// postComment sends the comment to GitHub and returns a commentPostedMsg.
+func (m *Model) postComment(t *model.Thread, body string) tea.Cmd {
+	return func() tea.Msg {
+		if err := m.client.ReplyToThread(m.pr.Number, t.RootID, body); err != nil {
+			return statusMsg{err: fmt.Errorf("posting comment: %w", err)}
+		}
+
+		user, _ := m.client.CurrentUser()
 		return commentPostedMsg{
-			threadIndex: ep.thread.Index,
-			comment:     ep.posted,
+			threadIndex: t.Index,
+			comment: model.Comment{
+				User:      user,
+				UserType:  "User",
+				Body:      body,
+				CreatedAt: time.Now(),
+			},
 		}
-	})
+	}
 }
-
-// editorProcess implements tea.ExecCommand for the editor flow.
-type editorProcess struct {
-	thread *model.Thread
-	client *github.Client
-	prNum  int
-	posted model.Comment // populated after successful post
-}
-
-func (e *editorProcess) Run() error {
-	body, err := editor.EditReply(e.thread)
-	if err != nil {
-		return err
-	}
-	if body == "" {
-		return fmt.Errorf("aborted (empty message)")
-	}
-	if err := e.client.ReplyToThread(e.prNum, e.thread.RootID, body); err != nil {
-		return err
-	}
-
-	// Build the local comment for immediate display
-	user, _ := e.client.CurrentUser()
-	e.posted = model.Comment{
-		User:      user,
-		UserType:  "User",
-		Body:      body,
-		CreatedAt: time.Now(),
-	}
-	return nil
-}
-
-func (e *editorProcess) SetStdin(_ io.Reader)  {}
-func (e *editorProcess) SetStdout(_ io.Writer) {}
-func (e *editorProcess) SetStderr(_ io.Writer) {}
