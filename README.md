@@ -7,6 +7,8 @@ comment, resolve, or unresolve threads without leaving the terminal.
 Opens a full-screen TUI by default. Resolved threads are hidden by
 default. Thread indexes are stable regardless of filters.
 
+![demo](demo.gif)
+
 ## Install
 
 ```bash
