@@ -137,5 +137,6 @@ show open threads.
 
 ## Requirements
 
-- [gh](https://cli.github.com/) (authenticated)
-- Go 1.22+
+- [gh](https://cli.github.com/) (authenticated — gh-review reads its auth config)
+- `git` (for current branch detection)
+- Go 1.22+ (build only)

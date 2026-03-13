@@ -1,75 +1,133 @@
-// Package github provides API access to PR review threads using the gh CLI.
-// It shells out to `gh` for authentication and API calls, keeping the
-// dependency footprint minimal.
+// Package github provides API access to PR review threads using go-gh.
+// It reads authentication from gh's config, so gh must be installed and
+// authenticated, but no subprocess is spawned for API calls.
 package github
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os/exec"
+	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/acardace/gh-review/internal/model"
+	"github.com/cli/go-gh/v2/pkg/api"
+	"github.com/cli/go-gh/v2/pkg/repository"
 )
 
-// Client talks to the GitHub API via the gh CLI.
+var linkNextRE = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+
+// Client talks to the GitHub API via go-gh.
 type Client struct {
-	repo string // "owner/repo"
+	rest               *api.RESTClient
+	gql                *api.GraphQLClient
+	repo               repository.Repository // effective repo (switches to upstream for forks)
+	currentUser        string                // cached authenticated user login
+	upstreamCandidates []remoteInfo          // non-user remotes to try for fork PR detection
 }
 
-// NewClient creates a client, auto-detecting the repo from the current directory.
+// NewClient creates a client, auto-detecting the repo from the current
+// directory. It fetches the current user once and caches it, then uses
+// git remotes to prepare fork detection. No redundant API calls.
 func NewClient() (*Client, error) {
-	out, err := ghExec("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+	repo, err := repository.Current()
 	if err != nil {
 		return nil, fmt.Errorf("not inside a GitHub repo: %w", err)
 	}
-	return &Client{repo: strings.TrimSpace(string(out))}, nil
+
+	opts := api.ClientOptions{Host: repo.Host}
+
+	rest, err := api.NewRESTClient(opts)
+	if err != nil {
+		return nil, fmt.Errorf("creating REST client: %w", err)
+	}
+	gql, err := api.NewGraphQLClient(opts)
+	if err != nil {
+		return nil, fmt.Errorf("creating GraphQL client: %w", err)
+	}
+
+	c := &Client{rest: rest, gql: gql, repo: repo}
+
+	// Fetch current user once — used for fork detection, needs-reply, etc.
+	c.currentUser, _ = c.fetchCurrentUser()
+
+	// Parse git remotes (local, no API call) to find upstream candidates.
+	c.detectUpstreamCandidates()
+
+	return c, nil
 }
 
-// Repo returns the owner/repo string.
-func (c *Client) Repo() string { return c.repo }
+// CurrentUser returns the cached authenticated user login.
+func (c *Client) CurrentUser() string {
+	return c.currentUser
+}
 
-// CurrentUser returns the authenticated user's login.
-func (c *Client) CurrentUser() (string, error) {
-	out, err := ghExec("api", "user", "--jq", ".login")
-	if err != nil {
+// Repo returns the "owner/repo" string.
+func (c *Client) Repo() string {
+	return c.repo.Owner + "/" + c.repo.Name
+}
+
+// fetchCurrentUser makes a single API call to get the authenticated user.
+func (c *Client) fetchCurrentUser() (string, error) {
+	var user struct {
+		Login string `json:"login"`
+	}
+	if err := c.rest.Get("user", &user); err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return user.Login, nil
 }
 
-const prFields = "number,title,url,state,author,baseRefName,headRefName"
+// detectUpstreamCandidates parses git remotes and collects those that
+// don't belong to the current user — potential upstream repos for forks.
+func (c *Client) detectUpstreamCandidates() {
+	if c.currentUser == "" {
+		return
+	}
+
+	remotes, err := gitRemotes()
+	if err != nil {
+		return
+	}
+
+	for _, r := range remotes {
+		if r.owner != c.currentUser {
+			c.upstreamCandidates = append(c.upstreamCandidates, r)
+		}
+	}
+}
+
+// -- PR info ------------------------------------------------------------------
 
 // GetPRInfo fetches PR metadata. If prNum is 0, auto-detects from current branch.
 func (c *Client) GetPRInfo(prNum int) (*model.PRInfo, error) {
-	args := []string{"pr", "view"}
-	if prNum > 0 {
-		args = append(args, strconv.Itoa(prNum))
-	}
-	args = append(args, "--json", prFields)
-
-	out, err := ghExec(args...)
-	if err != nil {
-		return nil, fmt.Errorf("no PR found: %w", err)
+	if prNum == 0 {
+		return c.getPRForCurrentBranch()
 	}
 
 	var raw struct {
-		Number      int    `json:"number"`
-		Title       string `json:"title"`
-		URL         string `json:"url"`
-		State       string `json:"state"`
-		BaseRefName string `json:"baseRefName"`
-		HeadRefName string `json:"headRefName"`
-		Author      struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		URL    string `json:"html_url"`
+		State  string `json:"state"`
+		Base   struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+		Head struct {
+			Ref string `json:"ref"`
+		} `json:"head"`
+		User struct {
 			Login string `json:"login"`
-		} `json:"author"`
+		} `json:"user"`
 	}
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, fmt.Errorf("parsing PR info: %w", err)
+
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d", c.repo.Owner, c.repo.Name, prNum)
+	if err := c.rest.Get(path, &raw); err != nil {
+		return nil, fmt.Errorf("fetching PR #%d: %w", prNum, err)
 	}
 
 	return &model.PRInfo{
@@ -77,13 +135,90 @@ func (c *Client) GetPRInfo(prNum int) (*model.PRInfo, error) {
 		Title:  raw.Title,
 		URL:    raw.URL,
 		State:  raw.State,
-		Author: raw.Author.Login,
-		Base:   raw.BaseRefName,
-		Head:   raw.HeadRefName,
+		Author: raw.User.Login,
+		Base:   raw.Base.Ref,
+		Head:   raw.Head.Ref,
 	}, nil
 }
 
-// -- REST API types -----------------------------------------------------------
+// getPRForCurrentBranch detects the current git branch and finds the
+// matching open PR. Tries the current repo first (non-fork), then
+// each upstream candidate (fork workflow).
+func (c *Client) getPRForCurrentBranch() (*model.PRInfo, error) {
+	branch, err := currentBranch()
+	if err != nil {
+		return nil, fmt.Errorf("detecting current branch: %w", err)
+	}
+
+	headOwner := c.currentUser
+	if headOwner == "" {
+		headOwner = c.repo.Owner
+	}
+
+	// Try the current repo (non-fork case).
+	if pr, err := c.searchPR(c.repo.Owner, c.repo.Name, headOwner, branch); err == nil {
+		return pr, nil
+	}
+
+	// Try each upstream candidate (fork case).
+	for _, candidate := range c.upstreamCandidates {
+		if pr, err := c.searchPR(candidate.owner, candidate.name, headOwner, branch); err == nil {
+			// Switch to upstream for all subsequent API calls.
+			c.repo = repository.Repository{
+				Host:  c.repo.Host,
+				Owner: candidate.owner,
+				Name:  candidate.name,
+			}
+			return pr, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no open PR found for branch %q", branch)
+}
+
+// prSearchResult is the shape returned by the pulls search endpoint.
+type prSearchResult struct {
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	URL    string `json:"html_url"`
+	State  string `json:"state"`
+	Base   struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+	Head struct {
+		Ref string `json:"ref"`
+	} `json:"head"`
+	User struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// searchPR queries a repo for an open PR matching the given head owner:branch.
+func (c *Client) searchPR(repoOwner, repoName, headOwner, branch string) (*model.PRInfo, error) {
+	path := fmt.Sprintf("repos/%s/%s/pulls?head=%s:%s&state=open&per_page=1",
+		repoOwner, repoName, headOwner, branch)
+
+	var prs []prSearchResult
+	if err := c.rest.Get(path, &prs); err != nil {
+		return nil, err
+	}
+	if len(prs) == 0 {
+		return nil, fmt.Errorf("no PR found")
+	}
+
+	pr := prs[0]
+	return &model.PRInfo{
+		Number: pr.Number,
+		Title:  pr.Title,
+		URL:    pr.URL,
+		State:  pr.State,
+		Author: pr.User.Login,
+		Base:   pr.Base.Ref,
+		Head:   pr.Head.Ref,
+	}, nil
+}
+
+// -- Comments & Threads -------------------------------------------------------
 
 type reviewComment struct {
 	ID          int64  `json:"id"`
@@ -112,26 +247,13 @@ type issueComment struct {
 	} `json:"user"`
 }
 
-// -- GraphQL types ------------------------------------------------------------
-
-type gqlThreadInfo struct {
-	RootCommentID int64
-	ThreadNodeID  string
-	IsResolved    bool
-}
-
-// -- Public API ---------------------------------------------------------------
-
 // GetIssueComments fetches top-level PR conversation comments.
 func (c *Client) GetIssueComments(prNum int) ([]model.Comment, error) {
-	out, err := ghExec("api", fmt.Sprintf("repos/%s/issues/%d/comments", c.repo, prNum), "--paginate")
-	if err != nil {
-		return nil, fmt.Errorf("fetching issue comments: %w", err)
-	}
+	path := fmt.Sprintf("repos/%s/%s/issues/%d/comments?per_page=100", c.repo.Owner, c.repo.Name, prNum)
 
 	var raw []issueComment
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, fmt.Errorf("parsing issue comments: %w", err)
+	if err := paginateREST(c, path, &raw); err != nil {
+		return nil, fmt.Errorf("fetching issue comments: %w", err)
 	}
 
 	comments := make([]model.Comment, 0, len(raw))
@@ -156,41 +278,31 @@ func (c *Client) GetThreads(prNum int) ([]model.Thread, error) {
 	commentsCh := make(chan commentsResult, 1)
 	infosCh := make(chan infosResult, 1)
 
-	// Fetch REST comments and GraphQL thread infos concurrently.
 	go func() {
-		out, err := ghExec("api", fmt.Sprintf("repos/%s/pulls/%d/comments", c.repo, prNum), "--paginate")
-		if err != nil {
-			commentsCh <- commentsResult{err: fmt.Errorf("fetching review comments: %w", err)}
-			return
-		}
+		path := fmt.Sprintf("repos/%s/%s/pulls/%d/comments?per_page=100", c.repo.Owner, c.repo.Name, prNum)
 		var raw []reviewComment
-		if err := json.Unmarshal(out, &raw); err != nil {
-			commentsCh <- commentsResult{err: fmt.Errorf("parsing review comments: %w", err)}
-			return
-		}
-		commentsCh <- commentsResult{comments: raw}
+		err := paginateREST(c, path, &raw)
+		commentsCh <- commentsResult{raw, err}
 	}()
 
 	go func() {
 		infos, err := c.fetchThreadInfos(prNum)
-		if err != nil {
-			infosCh <- infosResult{err: fmt.Errorf("fetching thread metadata: %w", err)}
-			return
-		}
-		infosCh <- infosResult{infos: infos}
+		infosCh <- infosResult{infos, err}
 	}()
 
 	cr := <-commentsCh
 	if cr.err != nil {
-		return nil, cr.err
+		return nil, fmt.Errorf("fetching review comments: %w", cr.err)
 	}
 	ir := <-infosCh
 	if ir.err != nil {
-		return nil, ir.err
+		return nil, fmt.Errorf("fetching thread metadata: %w", ir.err)
 	}
 
 	return buildThreads(cr.comments, ir.infos), nil
 }
+
+// -- Mutations ----------------------------------------------------------------
 
 // ResolveThread resolves a review thread via GraphQL mutation.
 func (c *Client) ResolveThread(threadNodeID string) error {
@@ -204,30 +316,32 @@ func (c *Client) UnresolveThread(threadNodeID string) error {
 
 // ReplyToThread posts a reply to a review comment thread.
 func (c *Client) ReplyToThread(prNum int, rootCommentID int64, body string) error {
-	_, err := ghExec("api",
-		fmt.Sprintf("repos/%s/pulls/%d/comments/%d/replies", c.repo, prNum, rootCommentID),
-		"-f", "body="+body,
-	)
-	return err
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%d/replies", c.repo.Owner, c.repo.Name, prNum, rootCommentID)
+	payload := strings.NewReader(fmt.Sprintf(`{"body":%q}`, body))
+	return c.rest.Post(path, payload, nil)
 }
 
 // -- Internal helpers ---------------------------------------------------------
 
 func (c *Client) mutateThread(mutation, threadNodeID string) error {
 	query := fmt.Sprintf(`mutation { %s(input: {threadId: %q}) { thread { isResolved } } }`, mutation, threadNodeID)
-	_, err := ghExec("api", "graphql", "-f", "query="+query)
-	return err
+	return c.gql.Do(query, nil, nil)
+}
+
+type gqlThreadInfo struct {
+	RootCommentID int64
+	ThreadNodeID  string
+	IsResolved    bool
 }
 
 func (c *Client) fetchThreadInfos(prNum int) ([]gqlThreadInfo, error) {
-	owner, repoName := splitRepo(c.repo)
 	var all []gqlThreadInfo
-	var cursor string
+	var cursor *string
 
 	for {
 		afterClause := "null"
-		if cursor != "" {
-			afterClause = fmt.Sprintf("%q", cursor)
+		if cursor != nil {
+			afterClause = fmt.Sprintf("%q", *cursor)
 		}
 
 		query := fmt.Sprintf(`query {
@@ -243,41 +357,35 @@ func (c *Client) fetchThreadInfos(prNum int) ([]gqlThreadInfo, error) {
 					}
 				}
 			}
-		}`, owner, repoName, prNum, afterClause)
+		}`, c.repo.Owner, c.repo.Name, prNum, afterClause)
 
-		out, err := ghExec("api", "graphql", "-f", "query="+query)
-		if err != nil {
+		var resp struct {
+			Repository struct {
+				PullRequest struct {
+					ReviewThreads struct {
+						PageInfo struct {
+							HasNextPage bool   `json:"hasNextPage"`
+							EndCursor   string `json:"endCursor"`
+						} `json:"pageInfo"`
+						Nodes []struct {
+							ID         string `json:"id"`
+							IsResolved bool   `json:"isResolved"`
+							Comments   struct {
+								Nodes []struct {
+									DatabaseID int64 `json:"databaseId"`
+								} `json:"nodes"`
+							} `json:"comments"`
+						} `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		}
+
+		if err := c.gql.Do(query, nil, &resp); err != nil {
 			return all, fmt.Errorf("fetching thread infos: %w", err)
 		}
 
-		var resp struct {
-			Data struct {
-				Repository struct {
-					PullRequest struct {
-						ReviewThreads struct {
-							PageInfo struct {
-								HasNextPage bool   `json:"hasNextPage"`
-								EndCursor   string `json:"endCursor"`
-							} `json:"pageInfo"`
-							Nodes []struct {
-								ID         string `json:"id"`
-								IsResolved bool   `json:"isResolved"`
-								Comments   struct {
-									Nodes []struct {
-										DatabaseID int64 `json:"databaseId"`
-									} `json:"nodes"`
-								} `json:"comments"`
-							} `json:"nodes"`
-						} `json:"reviewThreads"`
-					} `json:"pullRequest"`
-				} `json:"repository"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(out, &resp); err != nil {
-			return all, fmt.Errorf("parsing thread infos: %w", err)
-		}
-
-		for _, n := range resp.Data.Repository.PullRequest.ReviewThreads.Nodes {
+		for _, n := range resp.Repository.PullRequest.ReviewThreads.Nodes {
 			if len(n.Comments.Nodes) == 0 {
 				continue
 			}
@@ -288,16 +396,65 @@ func (c *Client) fetchThreadInfos(prNum int) ([]gqlThreadInfo, error) {
 			})
 		}
 
-		if !resp.Data.Repository.PullRequest.ReviewThreads.PageInfo.HasNextPage {
+		if !resp.Repository.PullRequest.ReviewThreads.PageInfo.HasNextPage {
 			break
 		}
-		cursor = resp.Data.Repository.PullRequest.ReviewThreads.PageInfo.EndCursor
+		endCursor := resp.Repository.PullRequest.ReviewThreads.PageInfo.EndCursor
+		cursor = &endCursor
 	}
 
 	return all, nil
 }
 
-// buildThreads groups raw comments into threads using GraphQL metadata.
+// -- Pagination ---------------------------------------------------------------
+
+// paginateREST fetches all pages of a REST endpoint and appends results to out.
+func paginateREST[T any](c *Client, path string, out *[]T) error {
+	for path != "" {
+		resp, err := c.rest.Request("GET", path, nil)
+		if err != nil {
+			return err
+		}
+
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		}
+		if err != nil {
+			return err
+		}
+
+		if err := paginateAppend(out, data); err != nil {
+			return err
+		}
+
+		path = nextPageURL(resp)
+	}
+	return nil
+}
+
+func paginateAppend[T any](out *[]T, data []byte) error {
+	var page []T
+	if err := json.Unmarshal(data, &page); err != nil {
+		return err
+	}
+	*out = append(*out, page...)
+	return nil
+}
+
+func nextPageURL(resp *http.Response) string {
+	for _, m := range linkNextRE.FindAllStringSubmatch(resp.Header.Get("Link"), -1) {
+		if len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// -- Thread building ----------------------------------------------------------
+
 func buildThreads(rawComments []reviewComment, infos []gqlThreadInfo) []model.Thread {
 	infoByRoot := make(map[int64]gqlThreadInfo, len(infos))
 	for _, ti := range infos {
@@ -392,22 +549,82 @@ func derefOr(p *int, fallback int) int {
 	return fallback
 }
 
-// ghExec runs `gh` with the given arguments and returns stdout.
-func ghExec(args ...string) ([]byte, error) {
-	out, err := exec.Command("gh", args...).Output()
+// -- Git helpers --------------------------------------------------------------
+
+// currentBranch returns the current git branch name.
+func currentBranch() (string, error) {
+	out, err := exec.Command("git", "branch", "--show-current").Output()
 	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return nil, fmt.Errorf("gh %s: %s", args[0], strings.TrimSpace(string(ee.Stderr)))
-		}
-		return nil, err
+		return "", err
 	}
-	return out, nil
+	branch := strings.TrimSpace(string(out))
+	if branch == "" {
+		return "", fmt.Errorf("detached HEAD, no branch")
+	}
+	return branch, nil
 }
 
-func splitRepo(repo string) (owner, name string) {
-	if i := strings.IndexByte(repo, '/'); i >= 0 {
-		return repo[:i], repo[i+1:]
+type remoteInfo struct {
+	remoteName string
+	owner      string
+	name       string
+}
+
+// gitRemotes parses `git remote -v` to extract owner/name for each remote.
+func gitRemotes() ([]remoteInfo, error) {
+	out, err := exec.Command("git", "remote", "-v").Output()
+	if err != nil {
+		return nil, err
 	}
-	return repo, ""
+
+	seen := make(map[string]bool)
+	var remotes []remoteInfo
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[0]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		owner, repo := parseRemoteURL(fields[1])
+		if owner != "" && repo != "" {
+			remotes = append(remotes, remoteInfo{remoteName: name, owner: owner, name: repo})
+		}
+	}
+	return remotes, nil
+}
+
+// parseRemoteURL extracts owner/name from SSH or HTTPS git URLs.
+func parseRemoteURL(url string) (owner, name string) {
+	// SSH: git@github.com:owner/repo.git
+	if strings.Contains(url, ":") && strings.Contains(url, "@") {
+		parts := strings.SplitN(url, ":", 2)
+		if len(parts) == 2 {
+			return parseOwnerName(parts[1])
+		}
+	}
+	// HTTPS: https://github.com/owner/repo.git
+	for _, prefix := range []string{"https://", "http://"} {
+		if strings.HasPrefix(url, prefix) {
+			path := strings.TrimPrefix(url, prefix)
+			if i := strings.IndexByte(path, '/'); i >= 0 {
+				return parseOwnerName(path[i+1:])
+			}
+		}
+	}
+	return "", ""
+}
+
+// parseOwnerName splits "owner/repo.git" into owner and repo.
+func parseOwnerName(path string) (string, string) {
+	path = strings.TrimSuffix(path, ".git")
+	owner, name, ok := strings.Cut(path, "/")
+	if !ok {
+		return "", ""
+	}
+	return owner, name
 }

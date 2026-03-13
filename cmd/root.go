@@ -88,35 +88,12 @@ func run(w io.Writer, args []string, opts *options) error {
 		return err
 	}
 
-	// Fetch threads and current user in parallel.
-	type threadResult struct {
-		threads []model.Thread
-		err     error
+	threads, err := client.GetThreads(pr.Number)
+	if err != nil {
+		return fmt.Errorf("fetching threads: %w", err)
 	}
-	type userResult struct {
-		user string
-		err  error
-	}
-	threadsCh := make(chan threadResult, 1)
-	userCh := make(chan userResult, 1)
 
-	go func() {
-		t, err := client.GetThreads(pr.Number)
-		threadsCh <- threadResult{t, err}
-	}()
-	go func() {
-		u, err := client.CurrentUser()
-		userCh <- userResult{u, err}
-	}()
-
-	tr := <-threadsCh
-	if tr.err != nil {
-		return fmt.Errorf("fetching threads: %w", tr.err)
-	}
-	threads := tr.threads
-
-	ur := <-userCh
-	currentUser := ur.user // ignore error, non-critical
+	currentUser := client.CurrentUser()
 
 	// Action flags bypass the TUI.
 	switch {
