@@ -8,6 +8,7 @@ import (
 
 	"github.com/acardace/gh-review/internal/github"
 	"github.com/acardace/gh-review/internal/model"
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -26,21 +27,42 @@ const (
 type screen int
 
 const (
-	screenList screen = iota
+	screenLoading screen = iota
+	screenList
 	screenDetail
 )
 
-// statusMsg is sent after an async operation to show feedback.
+// -- Messages -----------------------------------------------------------------
+
 type statusMsg struct {
 	text string
 	err  error
 }
 
-// commentPostedMsg is sent after a comment is successfully posted.
 type commentPostedMsg struct {
 	threadIndex int
 	comment     model.Comment
 }
+
+// clientReadyMsg is sent when the API client is initialized.
+type clientReadyMsg struct {
+	client *github.Client
+	err    error
+}
+
+// prLoadedMsg is sent when PR info is fetched.
+type prLoadedMsg struct {
+	pr  *model.PRInfo
+	err error
+}
+
+// threadsLoadedMsg is sent when threads are fetched.
+type threadsLoadedMsg struct {
+	threads []model.Thread
+	err     error
+}
+
+// -- Model --------------------------------------------------------------------
 
 // Model is the top-level bubbletea model.
 type Model struct {
@@ -48,6 +70,7 @@ type Model struct {
 	pr          *model.PRInfo
 	threads     []model.Thread
 	currentUser string
+	prNum       int // 0 = auto-detect
 
 	screen     screen
 	list       listView
@@ -62,30 +85,62 @@ type Model struct {
 	compose       composeView
 	composeThread *model.Thread
 
+	// Loading state
+	spinner    spinner.Model
+	loadingMsg string
+	loadingErr error
+
 	width, height int
 }
 
-// New creates the TUI model with pre-fetched data.
-func New(client *github.Client, pr *model.PRInfo, threads []model.Thread, currentUser string) Model {
-	return Model{
-		client:      client,
-		pr:          pr,
-		threads:     threads,
-		currentUser: currentUser,
-		screen:      screenList,
-		list:        newListView(threads, pr, currentUser),
-	}
-}
+// Run starts the TUI immediately with a loading screen, then fetches
+// all data progressively in the background.
+func Run(prNum int) error {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = dimStyle
 
-// Run starts the bubbletea program.
-func Run(client *github.Client, pr *model.PRInfo, threads []model.Thread, currentUser string) error {
-	m := New(client, pr, threads, currentUser)
+	m := Model{
+		screen:     screenLoading,
+		prNum:      prNum,
+		spinner:    s,
+		loadingMsg: "Connecting...",
+	}
+
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(
+		m.spinner.Tick,
+		initClient,
+	)
+}
+
+// -- Loading commands ---------------------------------------------------------
+
+func initClient() tea.Msg {
+	client, err := github.NewClient()
+	return clientReadyMsg{client, err}
+}
+
+func fetchPR(client *github.Client, prNum int) tea.Cmd {
+	return func() tea.Msg {
+		pr, err := client.GetPRInfo(prNum)
+		return prLoadedMsg{pr, err}
+	}
+}
+
+func fetchThreads(client *github.Client, prNum int) tea.Cmd {
+	return func() tea.Msg {
+		threads, err := client.GetThreads(prNum)
+		return threadsLoadedMsg{threads, err}
+	}
+}
+
+// -- Update -------------------------------------------------------------------
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -95,6 +150,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.width = msg.Width
 		m.list.height = msg.Height
 		m.updateDetailSize()
+		return m, nil
+
+	case tea.KeyMsg:
+		// Allow quit during loading
+		if m.screen == screenLoading {
+			if msg.String() == "q" || msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+		}
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
+	case clientReadyMsg:
+		if msg.err != nil {
+			m.loadingErr = msg.err
+			return m, nil
+		}
+		m.client = msg.client
+		m.loadingMsg = "Fetching PR..."
+		return m, fetchPR(m.client, m.prNum)
+
+	case prLoadedMsg:
+		if msg.err != nil {
+			m.loadingErr = msg.err
+			return m, nil
+		}
+		m.pr = msg.pr
+		m.currentUser = m.client.CurrentUser()
+		m.loadingMsg = "Fetching threads..."
+		return m, fetchThreads(m.client, m.pr.Number)
+
+	case threadsLoadedMsg:
+		if msg.err != nil {
+			m.loadingErr = msg.err
+			return m, nil
+		}
+		m.threads = msg.threads
+		m.screen = screenList
+		m.list = newListView(m.threads, m.pr, m.currentUser)
+		m.list.width = m.width
+		m.list.height = m.height
 		return m, nil
 
 	case statusMsg:
@@ -130,10 +229,51 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// -- View ---------------------------------------------------------------------
+
+func (m Model) View() string {
+	if m.width == 0 {
+		return ""
+	}
+
+	if m.screen == screenLoading {
+		return m.viewLoading()
+	}
+
+	var content, bar string
+	switch m.screen {
+	case screenList:
+		content = m.list.view()
+		bar = m.list.statusBar()
+	case screenDetail:
+		content = m.detail.view()
+		bar = m.detail.statusBar()
+	}
+
+	if m.composing {
+		content += m.compose.view() + "\n"
+		bar = statusBarStyle.Width(m.width).Render("ctrl+s: submit  esc: cancel")
+	} else if m.confirming {
+		bar = statusBarStyle.Width(m.width).Render(m.confirmMsg)
+	} else if m.status != "" {
+		bar = statusBarStyle.Width(m.width).Render(m.status)
+	}
+
+	return content + bar
+}
+
+func (m Model) viewLoading() string {
+	if m.loadingErr != nil {
+		return fmt.Sprintf("\n  Error: %v\n\n  Press q to quit.\n", m.loadingErr)
+	}
+	return fmt.Sprintf("\n  %s %s\n", m.spinner.View(), m.loadingMsg)
+}
+
+// -- Subview updates ----------------------------------------------------------
+
 func (m *Model) updateDetailSize() {
 	detailHeight := m.height
 	if m.composing {
-		// Reserve space for the compose box: border(2) + header line(1) + textarea lines + padding
 		detailHeight = m.height - composeHeight - 5
 		if detailHeight < 5 {
 			detailHeight = 5
@@ -227,13 +367,11 @@ func (m Model) handleAction(action viewAction, cmd tea.Cmd, t *model.Thread) (te
 			m.composeThread = t
 			m.compose = newComposeView(m.width)
 			m.status = ""
-			// If we're on the list, switch to detail first
 			if m.screen == screenList {
 				m.screen = screenDetail
 				m.detail = newDetailView(t, m.pr, m.currentUser, m.width, m.height, m.list.hideBots)
 			}
 			m.updateDetailSize()
-			// Scroll detail to bottom so context is visible
 			maxScroll := max(0, len(m.detail.lines)-m.detail.contentHeight())
 			m.detail.scroll = maxScroll
 			return m, m.compose.textarea.Focus()
@@ -250,32 +388,7 @@ func (m Model) askConfirm(msg string, fn func() tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) View() string {
-	if m.width == 0 {
-		return "Loading..."
-	}
-
-	var content, bar string
-	switch m.screen {
-	case screenList:
-		content = m.list.view()
-		bar = m.list.statusBar()
-	case screenDetail:
-		content = m.detail.view()
-		bar = m.detail.statusBar()
-	}
-
-	if m.composing {
-		content += m.compose.view() + "\n"
-		bar = statusBarStyle.Width(m.width).Render("ctrl+s: submit  esc: cancel")
-	} else if m.confirming {
-		bar = statusBarStyle.Width(m.width).Render(m.confirmMsg)
-	} else if m.status != "" {
-		bar = statusBarStyle.Width(m.width).Render(m.status)
-	}
-
-	return content + bar
-}
+// -- Thread mutations ---------------------------------------------------------
 
 func (m *Model) resolveThreadFn(t *model.Thread) func() tea.Msg {
 	return m.toggleResolveFn(t, true)
@@ -315,8 +428,6 @@ func (m *Model) toggleResolveFn(t *model.Thread, resolve bool) func() tea.Msg {
 	}
 }
 
-// appendComment adds the posted comment to the thread and re-renders
-// the detail view if we're looking at that thread.
 func (m *Model) appendComment(msg commentPostedMsg) {
 	for i := range m.threads {
 		if m.threads[i].Index == msg.threadIndex {
@@ -332,7 +443,6 @@ func (m *Model) appendComment(msg commentPostedMsg) {
 	}
 }
 
-// postComment sends the comment to GitHub and returns a commentPostedMsg.
 func (m *Model) postComment(t *model.Thread, body string) tea.Cmd {
 	return func() tea.Msg {
 		if err := m.client.ReplyToThread(m.pr.Number, t.RootID, body); err != nil {

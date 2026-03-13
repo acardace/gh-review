@@ -27,6 +27,11 @@ type options struct {
 	unresolveThread int
 }
 
+func (o *options) hasActionFlag() bool {
+	return o.resolveThread > 0 || o.unresolveThread > 0 ||
+		o.replyThread > 0 || o.interactive || o.printMode
+}
+
 func NewRootCmd() *cobra.Command {
 	var opts options
 
@@ -69,11 +74,6 @@ right thread.`,
 }
 
 func run(w io.Writer, args []string, opts *options) error {
-	client, err := github.NewClient()
-	if err != nil {
-		return err
-	}
-
 	prNum := 0
 	if len(args) == 1 {
 		n, err := strconv.Atoi(args[0])
@@ -81,6 +81,17 @@ func run(w io.Writer, args []string, opts *options) error {
 			return fmt.Errorf("invalid PR number: %s", args[0])
 		}
 		prNum = n
+	}
+
+	// TUI mode: launch immediately, data loads in background.
+	if !opts.hasActionFlag() {
+		return tui.Run(prNum)
+	}
+
+	// Non-TUI modes need data upfront.
+	client, err := github.NewClient()
+	if err != nil {
+		return err
 	}
 
 	pr, err := client.GetPRInfo(prNum)
@@ -93,21 +104,16 @@ func run(w io.Writer, args []string, opts *options) error {
 		return fmt.Errorf("fetching threads: %w", err)
 	}
 
-	currentUser := client.CurrentUser()
+	render.PRHeader(w, pr)
 
-	// Action flags bypass the TUI.
 	switch {
 	case opts.resolveThread > 0:
-		render.PRHeader(w, pr)
 		return handleResolve(w, client, threads, opts)
 	case opts.unresolveThread > 0:
-		render.PRHeader(w, pr)
 		return handleUnresolve(w, client, threads, opts)
 	case opts.replyThread > 0:
-		render.PRHeader(w, pr)
 		return handleReply(w, client, pr.Number, threads, opts)
 	case opts.interactive:
-		render.PRHeader(w, pr)
 		issueComments, err := client.GetIssueComments(pr.Number)
 		if err != nil {
 			return fmt.Errorf("fetching comments: %w", err)
@@ -115,14 +121,13 @@ func run(w io.Writer, args []string, opts *options) error {
 		render.IssueComments(w, issueComments, opts.noBots)
 		return interactive.Run(w, client, pr.Number, threads, opts.noBots)
 	case opts.printMode:
-		render.PRHeader(w, pr)
 		issueComments, err := client.GetIssueComments(pr.Number)
 		if err != nil {
 			return fmt.Errorf("fetching comments: %w", err)
 		}
 		return handleList(w, pr, issueComments, threads, opts)
 	default:
-		return tui.Run(client, pr, threads, currentUser)
+		return nil // unreachable
 	}
 }
 
