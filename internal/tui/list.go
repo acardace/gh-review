@@ -12,6 +12,7 @@ import (
 // listView is the thread list screen.
 type listView struct {
 	threads       []model.Thread
+	pr            *model.PRInfo
 	currentUser   string
 	cursor        int
 	offset        int // scroll offset for the list
@@ -20,8 +21,8 @@ type listView struct {
 	width, height int
 }
 
-func newListView(threads []model.Thread, currentUser string) listView {
-	return listView{threads: threads, currentUser: currentUser}
+func newListView(threads []model.Thread, pr *model.PRInfo, currentUser string) listView {
+	return listView{threads: threads, pr: pr, currentUser: currentUser}
 }
 
 func (l listView) visible() []int {
@@ -145,8 +146,8 @@ func (l listView) view() string {
 	if l.hideBots {
 		filters = append(filters, "no bots")
 	}
-	header := titleStyle.Render(fmt.Sprintf(" Review Threads (%d open, %d resolved) [%s] ",
-		open, resolved, strings.Join(filters, ", ")))
+	header := titleStyle.Render(fmt.Sprintf(" PR #%d: %s  (%d open, %d resolved) [%s] ",
+		l.pr.Number, l.pr.Title, open, resolved, strings.Join(filters, ", ")))
 	b.WriteString(header + "\n\n")
 
 	if len(vis) == 0 {

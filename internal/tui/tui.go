@@ -72,7 +72,7 @@ func New(client *github.Client, pr *model.PRInfo, threads []model.Thread) Model 
 		pr:      pr,
 		threads: threads,
 		screen:  screenList,
-		list:    newListView(threads, user),
+		list:    newListView(threads, pr, user),
 	}
 }
 
