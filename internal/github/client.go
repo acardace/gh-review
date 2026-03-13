@@ -324,10 +324,7 @@ func buildThreads(rawComments []reviewComment, infos []gqlThreadInfo) []model.Th
 	}
 
 	sort.Slice(result, func(i, j int) bool {
-		if result[i].Path != result[j].Path {
-			return result[i].Path < result[j].Path
-		}
-		return result[i].Line < result[j].Line
+		return result[i].Comments[0].CreatedAt.Before(result[j].Comments[0].CreatedAt)
 	})
 
 	for i := range result {
