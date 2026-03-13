@@ -163,6 +163,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
+		// Update spinner in status text if we're loading threads on the list screen.
+		if m.screen == screenList && m.threads == nil {
+			m.status = m.spinner.View() + " Loading threads..."
+		}
 		return m, cmd
 
 	case clientReadyMsg:
@@ -181,19 +185,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.pr = msg.pr
 		m.currentUser = m.client.CurrentUser()
-		m.loadingMsg = "Fetching threads..."
-		return m, fetchThreads(m.client, m.pr.Number)
+		// Switch to list view immediately with empty threads.
+		// Show "loading threads..." status while fetching.
+		m.screen = screenList
+		m.list = newListView(nil, m.pr, m.currentUser)
+		m.list.width = m.width
+		m.list.height = m.height
+		m.status = m.spinner.View() + " Loading threads..."
+		return m, tea.Batch(m.spinner.Tick, fetchThreads(m.client, m.pr.Number))
 
 	case threadsLoadedMsg:
 		if msg.err != nil {
-			m.loadingErr = msg.err
+			m.status = fmt.Sprintf("Error loading threads: %v", msg.err)
 			return m, nil
 		}
 		m.threads = msg.threads
-		m.screen = screenList
-		m.list = newListView(m.threads, m.pr, m.currentUser)
-		m.list.width = m.width
-		m.list.height = m.height
+		m.list.threads = m.threads
+		m.list.clampCursor()
+		m.status = ""
 		return m, nil
 
 	case statusMsg:
