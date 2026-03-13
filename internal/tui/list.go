@@ -12,6 +12,7 @@ import (
 // listView is the thread list screen.
 type listView struct {
 	threads       []model.Thread
+	currentUser   string
 	cursor        int
 	offset        int // scroll offset for the list
 	showResolved  bool
@@ -19,8 +20,8 @@ type listView struct {
 	width, height int
 }
 
-func newListView(threads []model.Thread) listView {
-	return listView{threads: threads}
+func newListView(threads []model.Thread, currentUser string) listView {
+	return listView{threads: threads, currentUser: currentUser}
 }
 
 func (l listView) visible() []int {
@@ -174,22 +175,34 @@ func (l listView) view() string {
 			badge = resolvedBadge
 		}
 
-		// First line: index, file:line, status
-		line1 := fmt.Sprintf("%s%s  %s:%d  %s  (%d)",
+		// Who spoke last?
+		var turnTag string
+		if len(t.Comments) > 0 && l.currentUser != "" {
+			last := t.Comments[len(t.Comments)-1]
+			if last.User == l.currentUser {
+				turnTag = dimStyle.Render("  waiting")
+			} else {
+				turnTag = lipgloss.NewStyle().Foreground(colorCyan).Render("  ← needs reply")
+			}
+		}
+
+		// First line: index, file:line, status, turn indicator
+		line1 := fmt.Sprintf("%s%s  %s:%d  %s  (%d)%s",
 			cursor,
 			style.Render(fmt.Sprintf("#%d", t.Index)),
 			style.Render(t.Path),
 			t.Line,
 			badge,
 			len(t.Comments),
+			turnTag,
 		)
 
-		// Second line: first comment preview
+		// Second line: last comment preview
 		preview := ""
 		if len(t.Comments) > 0 {
-			c := t.Comments[0]
-			body := strings.Join(strings.Fields(c.Body), " ")
-			author := dimStyle.Render(fmt.Sprintf("@%s: ", c.User))
+			last := t.Comments[len(t.Comments)-1]
+			body := strings.Join(strings.Fields(last.Body), " ")
+			author := dimStyle.Render(fmt.Sprintf("@%s: ", last.User))
 
 			maxBody := l.width - lipgloss.Width(author) - 6
 			if maxBody > 0 && len(body) > maxBody {

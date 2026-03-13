@@ -66,12 +66,13 @@ type Model struct {
 
 // New creates the TUI model with pre-fetched data.
 func New(client *github.Client, pr *model.PRInfo, threads []model.Thread) Model {
+	user, _ := client.CurrentUser()
 	return Model{
 		client:  client,
 		pr:      pr,
 		threads: threads,
 		screen:  screenList,
-		list:    newListView(threads),
+		list:    newListView(threads, user),
 	}
 }
 
