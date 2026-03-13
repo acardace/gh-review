@@ -203,7 +203,7 @@ func (m Model) handleAction(action viewAction, cmd tea.Cmd, t *model.Thread) (te
 	case actionOpenDetail:
 		if t != nil {
 			m.screen = screenDetail
-			m.detail = newDetailView(t, m.width, m.height, m.list.hideBots)
+			m.detail = newDetailView(t, m.pr, m.list.currentUser, m.width, m.height, m.list.hideBots)
 			m.status = ""
 		}
 	case actionResolve:
@@ -229,7 +229,7 @@ func (m Model) handleAction(action viewAction, cmd tea.Cmd, t *model.Thread) (te
 			// If we're on the list, switch to detail first
 			if m.screen == screenList {
 				m.screen = screenDetail
-				m.detail = newDetailView(t, m.width, m.height, m.list.hideBots)
+				m.detail = newDetailView(t, m.pr, m.list.currentUser, m.width, m.height, m.list.hideBots)
 			}
 			m.updateDetailSize()
 			// Scroll detail to bottom so context is visible

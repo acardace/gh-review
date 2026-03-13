@@ -18,6 +18,7 @@ type listView struct {
 	offset        int // scroll offset for the list
 	showResolved  bool
 	hideBots      bool
+	needsReply    bool // only show threads awaiting your reply
 	width, height int
 }
 
@@ -34,66 +35,89 @@ func (l listView) visible() []int {
 		if l.hideBots && model.AllBots(t.Comments) {
 			continue
 		}
+		if l.needsReply {
+			if !l.threadNeedsReply(&t) {
+				continue
+			}
+		}
 		indices = append(indices, i)
 	}
 	return indices
 }
 
+func (l listView) threadNeedsReply(t *model.Thread) bool {
+	if l.currentUser == "" || len(t.Comments) == 0 {
+		return false
+	}
+	return t.Comments[len(t.Comments)-1].User != l.currentUser
+}
+
 func (l *listView) update(msg tea.Msg) (viewAction, tea.Cmd) {
 	vis := l.visible()
-	if len(vis) == 0 {
-		if msg, ok := msg.(tea.KeyMsg); ok && (msg.String() == "q" || msg.String() == "ctrl+c") {
-			return actionQuit, nil
-		}
-		return actionNone, nil
-	}
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return actionQuit, nil
+
+		// Filters — always available, even with empty list
+		case "tab":
+			l.needsReply = !l.needsReply
+			l.clampCursor()
+		case "a":
+			l.showResolved = !l.showResolved
+			l.clampCursor()
+		case "b":
+			l.hideBots = !l.hideBots
+			l.clampCursor()
+
+		// Navigation and actions — only when there are visible threads
 		case "up", "k":
-			if l.cursor > 0 {
+			if len(vis) > 0 && l.cursor > 0 {
 				l.cursor--
 				l.ensureVisible()
 			}
 		case "down", "j":
-			if l.cursor < len(vis)-1 {
+			if len(vis) > 0 && l.cursor < len(vis)-1 {
 				l.cursor++
 				l.ensureVisible()
 			}
 		case "enter", "l":
-			return actionOpenDetail, nil
+			if len(vis) > 0 {
+				return actionOpenDetail, nil
+			}
 		case "r":
-			return actionResolve, nil
+			if len(vis) > 0 {
+				return actionResolve, nil
+			}
 		case "u":
-			return actionUnresolve, nil
+			if len(vis) > 0 {
+				return actionUnresolve, nil
+			}
 		case "c":
-			return actionComment, nil
-		case "tab":
-			l.showResolved = !l.showResolved
-			vis = l.visible()
-			if l.cursor >= len(vis) {
-				l.cursor = max(0, len(vis)-1)
+			if len(vis) > 0 {
+				return actionComment, nil
 			}
-			l.offset = 0
-		case "b":
-			l.hideBots = !l.hideBots
-			vis = l.visible()
-			if l.cursor >= len(vis) {
-				l.cursor = max(0, len(vis)-1)
-			}
-			l.offset = 0
 		case "g", "home":
 			l.cursor = 0
 			l.offset = 0
 		case "G", "end":
-			l.cursor = len(vis) - 1
-			l.ensureVisible()
+			if len(vis) > 0 {
+				l.cursor = len(vis) - 1
+				l.ensureVisible()
+			}
 		}
 	}
 	return actionNone, nil
+}
+
+func (l *listView) clampCursor() {
+	vis := l.visible()
+	if l.cursor >= len(vis) {
+		l.cursor = max(0, len(vis)-1)
+	}
+	l.offset = 0
 }
 
 func (l *listView) ensureVisible() {
@@ -146,6 +170,9 @@ func (l listView) view() string {
 	if l.hideBots {
 		filters = append(filters, "no bots")
 	}
+	if l.needsReply {
+		filters = append(filters, "needs reply")
+	}
 	header := titleStyle.Render(fmt.Sprintf(" PR #%d: %s  (%d open, %d resolved) [%s] ",
 		l.pr.Number, l.pr.Title, open, resolved, strings.Join(filters, ", ")))
 	b.WriteString(header + "\n\n")
@@ -178,13 +205,8 @@ func (l listView) view() string {
 
 		// Who spoke last?
 		var turnTag string
-		if len(t.Comments) > 0 && l.currentUser != "" {
-			last := t.Comments[len(t.Comments)-1]
-			if last.User == l.currentUser {
-				turnTag = dimStyle.Render("  waiting")
-			} else {
-				turnTag = lipgloss.NewStyle().Foreground(colorCyan).Render("  ← needs reply")
-			}
+		if l.threadNeedsReply(t) {
+			turnTag = lipgloss.NewStyle().Foreground(colorCyan).Render("  ← needs reply")
 		}
 
 		// First line: index, file:line, status, turn indicator
@@ -220,6 +242,6 @@ func (l listView) view() string {
 }
 
 func (l listView) statusBar() string {
-	keys := "j/k: navigate  enter: view  c: comment  r: resolve  u: unresolve  tab: toggle resolved  b: toggle bots  q: quit"
+	keys := "j/k: navigate  enter: view  c: comment  r: resolve  u: unresolve  tab: needs reply  a: all/open  b: bots  q: quit"
 	return statusBarStyle.Width(l.width).Render(keys)
 }

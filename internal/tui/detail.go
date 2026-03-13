@@ -6,20 +6,23 @@ import (
 
 	"github.com/acardace/gh-review/internal/model"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 )
 
 // detailView shows a single thread with its diff hunk and all comments.
 type detailView struct {
 	thread        *model.Thread
+	pr            *model.PRInfo
+	currentUser   string
 	scroll        int
 	hideBots      bool
 	lines         []string // pre-rendered lines
 	width, height int
 }
 
-func newDetailView(t *model.Thread, width, height int, hideBots bool) detailView {
-	d := detailView{thread: t, width: width, height: height, hideBots: hideBots}
+func newDetailView(t *model.Thread, pr *model.PRInfo, currentUser string, width, height int, hideBots bool) detailView {
+	d := detailView{thread: t, pr: pr, currentUser: currentUser, width: width, height: height, hideBots: hideBots}
 	d.lines = d.render()
 	return d
 }
@@ -64,7 +67,7 @@ func (d *detailView) update(msg tea.Msg) (viewAction, tea.Cmd) {
 }
 
 func (d detailView) contentHeight() int {
-	return max(1, d.height-3) // header line + status bar (2 lines)
+	return max(1, d.height-4) // header (2 lines) + border/margin (1) + status bar (1)
 }
 
 func (d detailView) view() string {
@@ -75,8 +78,16 @@ func (d detailView) view() string {
 	if d.thread.Resolved {
 		status = resolvedBadge
 	}
+	needsReply := ""
+	if len(d.thread.Comments) > 0 && d.currentUser != "" {
+		last := d.thread.Comments[len(d.thread.Comments)-1]
+		if last.User != d.currentUser {
+			needsReply = lipgloss.NewStyle().Foreground(colorCyan).Render("  ← needs reply")
+		}
+	}
+
 	header := headerStyle.Width(d.width).Render(
-		fmt.Sprintf("#%d  %s:%d  %s", d.thread.Index, d.thread.Path, d.thread.Line, status),
+		fmt.Sprintf("PR #%d: %s\n#%d  %s:%d  %s%s", d.pr.Number, d.pr.Title, d.thread.Index, d.thread.Path, d.thread.Line, status, needsReply),
 	)
 	b.WriteString(header + "\n")
 
