@@ -20,7 +20,7 @@ type options struct {
 	noBots          bool
 	showResolved    bool
 	interactive     bool
-	tuiMode         bool
+	printMode       bool
 	replyThread     int
 	replyBody       string
 	resolveThread   int
@@ -35,6 +35,7 @@ func NewRootCmd() *cobra.Command {
 		Short: "Review PR comments in the terminal",
 		Long: `Show and interact with PR review comments for the current branch.
 
+Opens a full-screen TUI by default. Use --print for plain text output.
 Resolved threads are hidden by default. Thread indexes are stable
 regardless of filters, so --reply and --resolve always target the
 right thread.`,
@@ -53,10 +54,10 @@ right thread.`,
 	f.StringVarP(&opts.replyBody, "body", "b", "", "reply body text (used with --reply; opens $EDITOR if omitted)")
 	f.IntVar(&opts.resolveThread, "resolve", 0, "resolve a thread by stable index number")
 	f.IntVar(&opts.unresolveThread, "unresolve", 0, "unresolve a thread by stable index number")
-	f.BoolVarP(&opts.tuiMode, "tui", "t", false, "open full-screen TUI")
+	f.BoolVarP(&opts.printMode, "print", "p", false, "plain text output (no TUI)")
 
-	// --reply, --resolve, --unresolve, -i, and -t are mutually exclusive modes.
-	root.MarkFlagsMutuallyExclusive("reply", "resolve", "unresolve", "interactive", "tui")
+	// --reply, --resolve, --unresolve, -i, and -p are mutually exclusive modes.
+	root.MarkFlagsMutuallyExclusive("reply", "resolve", "unresolve", "interactive", "print")
 	// --body only makes sense with --reply.
 	root.MarkFlagsRequiredTogether("body", "reply")
 	// --resolved doesn't apply in interactive mode (only shows open).
@@ -92,29 +93,34 @@ func run(w io.Writer, args []string, opts *options) error {
 		return fmt.Errorf("fetching threads: %w", err)
 	}
 
-	if opts.tuiMode {
-		return tui.Run(client, pr, threads)
-	}
-
-	render.PRHeader(w, pr)
-
-	issueComments, err := client.GetIssueComments(pr.Number)
-	if err != nil {
-		return fmt.Errorf("fetching comments: %w", err)
-	}
-
+	// Action flags bypass the TUI.
 	switch {
 	case opts.resolveThread > 0:
+		render.PRHeader(w, pr)
 		return handleResolve(w, client, threads, opts)
 	case opts.unresolveThread > 0:
+		render.PRHeader(w, pr)
 		return handleUnresolve(w, client, threads, opts)
 	case opts.replyThread > 0:
+		render.PRHeader(w, pr)
 		return handleReply(w, client, pr.Number, threads, opts)
 	case opts.interactive:
+		render.PRHeader(w, pr)
+		issueComments, err := client.GetIssueComments(pr.Number)
+		if err != nil {
+			return fmt.Errorf("fetching comments: %w", err)
+		}
 		render.IssueComments(w, issueComments, opts.noBots)
 		return interactive.Run(w, client, pr.Number, threads, opts.noBots)
-	default:
+	case opts.printMode:
+		render.PRHeader(w, pr)
+		issueComments, err := client.GetIssueComments(pr.Number)
+		if err != nil {
+			return fmt.Errorf("fetching comments: %w", err)
+		}
 		return handleList(w, pr, issueComments, threads, opts)
+	default:
+		return tui.Run(client, pr, threads)
 	}
 }
 

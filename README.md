@@ -4,8 +4,8 @@ A `gh` CLI extension for reviewing pull request comments in the terminal.
 
 It groups review comments into threads, shows diff context, and lets you
 comment, resolve, or unresolve threads without leaving the terminal.
-Resolved threads are hidden by default. Thread indexes are stable
-regardless of filters.
+Opens a full-screen TUI by default. Resolved threads are hidden by
+default. Thread indexes are stable regardless of filters.
 
 ## Install
 
@@ -27,15 +27,16 @@ gh-review [PR_NUMBER] [flags]
 ```
 
 If `PR_NUMBER` is omitted, the PR for the current branch is used.
+Running with no flags opens the TUI.
 
 ### Flags
 
 | Flag | Description |
 |---|---|
-| `--resolved` | Include resolved threads in the listing |
+| `-p`, `--print` | Plain text output (no TUI) |
+| `--resolved` | Include resolved threads |
 | `--no-bot` | Hide bot comments |
 | `-i`, `--interactive` | Step through open threads one by one |
-| `-t`, `--tui` | Open full-screen TUI |
 | `--reply NUM` | Comment on a thread by index |
 | `--resolve NUM` | Resolve a thread by index |
 | `--unresolve NUM` | Unresolve a thread by index |
@@ -44,11 +45,14 @@ If `PR_NUMBER` is omitted, the PR for the current branch is used.
 ### Examples
 
 ```bash
-# List open review threads for the current branch's PR
+# Open TUI for the current branch's PR
 gh-review
 
-# Include resolved threads
-gh-review --resolved
+# Plain text listing
+gh-review -p
+
+# Plain text with resolved threads
+gh-review -p --resolved
 
 # Comment on thread #3 (opens $EDITOR with thread context)
 gh-review --reply 3
@@ -65,18 +69,14 @@ gh-review --unresolve 1
 # Interactive review: walk through each open thread
 gh-review -i
 
-# Full-screen TUI
-gh-review -t
-
 # Specific PR number
 gh-review 415
 ```
 
-### TUI mode
+### TUI
 
-`-t` opens a full-screen terminal UI with two screens. Colors use the
-terminal's ANSI palette, so they match the CLI output and respect your
-light/dark theme.
+The default mode. Colors use the terminal's ANSI palette, so they
+respect your light/dark theme.
 
 **List view** -- threads with status and first comment preview.
 
