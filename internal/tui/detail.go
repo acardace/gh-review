@@ -6,6 +6,7 @@ import (
 
 	"github.com/acardace/gh-review/internal/model"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 )
 
 // detailView shows a single thread with its diff hunk and all comments.
@@ -144,7 +145,7 @@ func (d detailView) render() []string {
 			lines = append(lines, authorStyle.Render(c.User)+"  "+ts)
 		}
 		lines = append(lines, "")
-		lines = append(lines, renderBody(c.Body)...)
+		lines = append(lines, renderBody(c.Body, d.width)...)
 		lines = append(lines, "")
 	}
 
@@ -152,9 +153,16 @@ func (d detailView) render() []string {
 }
 
 // renderBody converts markdown-like comment body to styled lines.
-func renderBody(body string) []string {
+// Non-code text is word-wrapped to fit within the terminal width.
+// Code blocks are left unwrapped to preserve formatting.
+func renderBody(body string, width int) []string {
 	var lines []string
 	inCode := false
+	// 2 chars indent
+	wrapWidth := width - 2
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
 
 	for _, line := range strings.Split(body, "\n") {
 		if strings.HasPrefix(line, "```") {
@@ -175,7 +183,9 @@ func renderBody(body string) []string {
 		if inCode {
 			lines = append(lines, codeBlockStyle.Render("  │ "+line))
 		} else {
-			lines = append(lines, "  "+highlightInline(line))
+			for _, wrapped := range wordWrap(line, wrapWidth) {
+				lines = append(lines, "  "+highlightInline(wrapped))
+			}
 		}
 	}
 
@@ -183,6 +193,38 @@ func renderBody(body string) []string {
 		lines = append(lines, dimStyle.Render("  └──"))
 	}
 
+	return lines
+}
+
+// wordWrap breaks a line into multiple lines at word boundaries,
+// using terminal-aware character widths (handles emoji, CJK, etc.).
+// Returns at least one line (empty string for empty input).
+func wordWrap(s string, width int) []string {
+	if runewidth.StringWidth(s) <= width {
+		return []string{s}
+	}
+
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return []string{s}
+	}
+
+	var lines []string
+	line := words[0]
+	lineWidth := runewidth.StringWidth(line)
+
+	for _, word := range words[1:] {
+		ww := runewidth.StringWidth(word)
+		if lineWidth+1+ww <= width {
+			line += " " + word
+			lineWidth += 1 + ww
+		} else {
+			lines = append(lines, line)
+			line = word
+			lineWidth = ww
+		}
+	}
+	lines = append(lines, line)
 	return lines
 }
 
