@@ -17,8 +17,7 @@ builds:
 archives:
   - format: binary
     # gh extension install expects: gh-review-{os}-{arch}[.exe]
-    name_template: >-
-      gh-review-{{ .Os }}-{{ .Arch }}{{ if eq .Os "windows" }}.exe{{ end }}
+    name_template: "gh-review-{{ .Os }}-{{ .Arch }}"
 
 checksum:
   name_template: checksums.txt
